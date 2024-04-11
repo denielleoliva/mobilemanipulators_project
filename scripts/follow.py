@@ -43,9 +43,6 @@ class Follower:
 	def get_force_vector(self):
 		pass
 
-	def set_command_vel_along_trajectory(self, trajectory):
-		pass
-
 	def tick(self):
 		
 		self.wait_until_updated()
@@ -58,8 +55,6 @@ class Follower:
 
 		self.publish_map()
 		self.publish_trajectory()
-
-		self.set_command_vel_along_trajectory(trajectory)
 
 
 if __name__ == '__main__':

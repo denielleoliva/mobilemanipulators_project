@@ -4,209 +4,126 @@ import copy
 
 import rospy
 
-from geometry_msgs.msg import WrenchStamped, PoseStamped
+from geometry_msgs.msg import WrenchStamped, PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Path
 from sensor_msgs.msg import LaserScan
 
-class OccupancyGridMap2D:
+def get_smallest_dist_and_direction(ang1, ang2):
 
-	def __init__(self):
-		self.grid = []
-		self.cost_grid = []
+    temp1 = ang1
+    temp2 = ang2
 
-		self.width = 200
-		self.height = 200
-		self.resolution = .05
+    if ang1 <= 0:
+        temp1 = math.pi * 2 + ang1
 
-		for i in range(self.width):
-			row = []
-			for j in range(self.height):
-				row.append(0)
+    if ang2 <= 0:
+        temp2 = math.pi * 2 + ang2
 
-			self.grid.append(row)
-			self.cost_grid.append(copy.deepcopy(row))
+    distance1 = temp1 - temp2
+    distance2 = temp2 - temp1
 
-	def reset_map(self):
-		for row in self.grid:
-			for col in range(len(row)):
-				row[col] = 0
+    if distance1 < 0:
+        distance1 += math.pi * 2
 
-	def reset_costs(self):
-		for row in self.cost_grid:
-			for col in range(len(row)):
-				row[col] = 0
+    if distance2 < 0:
+        distance2 += math.pi * 2
 
-	def init_costs(self, robot_positions):
-		for row in range(len(self.cost_grid)):
-			for col in range(len(self.cost_grid[row])):
-				if [row, col] in robot_positions:
-					self.cost_grid[row][col] = 0
-				else:
-					self.cost_grid[row][col] = 1000000
-
-	def init_utils(self):
-		for row in range(len(self.cost_grid)):
-			for col in range(len(self.cost_grid[row])):
-				self.util_grid[row][col] = 0
-
-	def init_from_scan(self, point_cloud):
-		self.resetMap()
-
-		# then yaknow init from velodyne lol
-
-	def in_bounds(self, point):
-		return point[0] >= 0 and point[0] < len(self.grid) and point[1] >= 0 and point[1] < len(self.grid[0])
-
-	def occupancy_between(self, start, end):
-
-		num_squares = 0
-
-		angle = math.atan2(end[1] - start[1], end[0] - start[0])
-
-		for i in range(round(math.dist(start, end))):
-
-			n_point = [0, 0]
-			n_point[0] = round(i * math.cos(angle) + start[0])
-			n_point[1] = round(i * math.sin(angle) + start[1])
-
-			if self.inBounds(n_point) and self.grid[n_point[0]][n_point[1]] > 0:
-				return True
-
-		return False
-
-
-	def label_map_for_goal(self, goal_point):
-		oob_right = False
-		oob_left = False
-		oob_top = False
-		oob_bottom = False
-
-		ray_len = 0
-
-
-	def to_msg(self):
-		n_msg = OccupancyGrid()
-
-		n_msg.header.stamp = rospy.Time.now()
-		n_msg.header.frame_id = 'map'
-
-		n_msg.info.resolution = self.resolution
-		n_msg.info.width = self.width
-		n_msg.info.height = self.height
-		n_msg.info.origin.orientation.w = 1.0
-
-		n_msg.data = []
-
-		for row, val in enumerate(self.grid): 
-			for col, measured_val in enumerate(val):
-				n_msg.data.append(measured_val)
-
-		return n_msg
+    if distance1 >= distance2:
+        return distance2, 'left'
+    else:
+        return distance1, 'right'
 
 class Follower:
 
-	def __init__(self):
-		self.updated_laser = False
-		self.updated_force = False
+	FORCE_THRESHOLD = 1.5
 
-		self.map = OccupancyGridMap2D()
-		
+	def __init__(self):
 		self.laser_sub = rospy.Subscriber('/base_scan', LaserScan, self.laser_cb)
 		self.force_sub = rospy.Subscriber('/force_topic', WrenchStamped, self.force_cb)
 
-		self.map_pub = rospy.Publisher('/map', OccupancyGrid, queue_size=1)
-		self.traj_pub = rospy.Publisher('/path', Path, queue_size=1)
+		self.cmd_vel_pub = rospy.Publisher('/bvr_sim/cmd_vel', Twist, queue_size=10)
 
 		self.saved_force = None
-		self.saved_laser = None
+		self.obstacles = []
 
-		self.traj = Path()
+	def update_obstacles_from_laser(self, data):
+		n_obstacles = []
+
+		for index, val in enumerate(data.ranges):
+			if val < data.range_min or val > data.range_max:
+				continue
+
+			angle = data.angle_min + index * angle_increment
+
+			n_x = val * math.cos(angle)
+			n_y = val * math.sin(angle)
+
+			n_obstacles.append(np.array([n_x, n_y]))
+
+		self.obstacles = n_obstacles
 
 	def laser_cb(self, data):
-
-		if not self.updated_laser:
-			self.saved_laser = data
-
-			self.updated_laser = True
+		self.update_obstacles_from_laser(data)
 
 	def force_cb(self, data):
+		self.saved_force = np.array([data.wrench.force.x, data.wrench.force.y, data.wrench.force.z, data.wrench.torque.x, data.wrench.torque.y, data.wrench.torque.z])
 
-		if not self.updated_force:
-			self.saved_force = data
+		self.transform_force()
 
-			self.updated_force = True
+	def calc_overall_force(self):
 
-	def pursue_trajectory(self):
-		pass
+		total_force = copy.deepcopy(self.saved_force)
+		current_obstacles = copy.deepcopy(self.obstacles) 
 
-	def cmd_vel_loop(self):
-		pass
+		# equations for attractive and repulsive force are taken from here: https://www.cs.cmu.edu/~motionplanning/lecture/Chap4-Potential-Field_howie.pdf
+		# max distance is one meter
+		q_star = 1.0
+		gains = np.array([.1, .1])
 
-	def wait_until_updated(self):
-		while not self.updated_force and not self.updated_laser:
-			rospy.spin_once()
+		for i in current_obstacles:
+			distance = np.linalg.norm(i)
 
-	def update_map(self):
-		self.map.init_from_scan(self.saved_laser)
+			if distance > q_star:
+				continue
 
-	def publish_map(self):
-		self.map_pub.publish(self.map.to_msg())
+			# I think the sign here is correct but it's questionable
+			total_force +=  gains * ( (1 / q_star) - ( 1 / distance ) ) * ( 1 / distance ** 2 )
 
-	def publish_trajectory(self):
-		self.traj_pub.publish(self.traj)
+		return total_force
 
-	def get_goal_point_from_force(self):
-		
-		# normalize the force vector to half the side length of the map as long as it's above the threshold value
-		# only considering the force for now, and discarding the z value to place it on a 2d plane
-		vector_norm = ( self.saved_force.wrench.force.x ** 2 + self.saved_force.wrench.force.y ** 2 + self.saved_force.wrench.force.z ** 2) ** 2
+	def wait_for_initial_scans(self):
+		while self.saved_force == None or self.obstacles == []:
+			pass
 
-		normalized_x_component = self.saved_force.wrench.force.x * ( .5 * self.map.width ) / vector_norm
-		normalized_y_component = self.saved_force.wrench.force.y * ( .5 * self.map.width ) / vector_norm
+	def get_twist_from_force(self, vel, delta_t=.2):
 
-		# get the end point of the vector
-		return [ int(normalized_x_component), int(normalized_y_component) ]
+		true_angle = math.atan2(vel[1], vel[0])
 
-	def get_trajectory(self, start_point, end_point):
-		
-		to_ret = Path()
+		dist, direction = get_smallest_dist_and_direction( 0, true_angle )
 
-		# just this for now
-		pose1 = PoseStamped()
-		pose1.header.frame_id = 'map'
-		pose1.pose.position.x = start_point[0]
-		pose1.pose.position.y = start_point[1]
-		pose1.pose.position.z = 0
-		pose1.pose.orientation.w = 1
+		twist = Twist()
 
-		pose2 = PoseStamped()
-		pose2.header.frame_id = 'map'
-		pose2.pose.position.x = goal_point[0]
-		pose2.pose.position.y = goal_point[1]
-		pose2.pose.position.z = 0
-		pose2.pose.orientation.w = 1
+		twist.linear.x = max(np.linalg.norm(vel) * math.cos(dist), 0)
 
-		to_ret.poses.append(pose1)
-		to_ret.poses.append(pose2)
+		if math.sqrt(vel[0] ** 2 + vel[1] ** 2 + vel[2] ** 2) == 0:
+			twist.angular.z = 0
+		elif direction == 'right':
+			twist.angular.z = -1 * dist / delta_t
+		else:
+			twist.angular.z = dist / delta_t
 
-		return to_ret
-
+		return twist
 
 	def tick(self):
 
-		self.updated_laser = False
-		self.updated_force = False
-		
-		self.wait_until_updated()
+		if np.linalg.norm(self.saved_force) < FORCE_THRESHOLD:
+			return
 
-		self.update_map()
+		total_force = self.calc_overall_force()
 
-		goal_point = self.get_goal_point_from_force()
+		twist = self.get_twist_from_force(total_force)
 
-		self.traj = self.get_trajectory([0, 0], goal_point)
-
-		self.publish_map()
-		self.publish_trajectory()
+		self.cmd_vel_pub.publish(twist)
 
 
 if __name__ == '__main__':
@@ -214,6 +131,8 @@ if __name__ == '__main__':
 	rospy.init("follower_node", anonymous=True)
 
 	follower_obj = Follower()
+
+	follower_obj.wait_for_initial_scans()
 
 	while rospy.ok():
 		follower_obj.tick()
